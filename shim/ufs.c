@@ -163,6 +163,8 @@ static const char *fs_type(uint32_t lba)
 	return "other";
 }
 
+static uint32_t ud_first, ud_blocks;	/* userdata, from list_partitions */
+
 /* One line per GPT entry of at least 64 MiB: name, first LBA, size in MiB (4K blocks). */
 static void list_partitions(uint32_t entry_lba, uint32_t nent)
 {
@@ -183,6 +185,10 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 			name[c] = (ch >= 32 && ch < 127) ? ch : (ch ? '?' : 0);
 		}
 		name[16] = 0;
+		if (!__builtin_strcmp(name, "userdata")) {
+			ud_first = (uint32_t)first;
+			ud_blocks = (uint32_t)(last - first + 1);
+		}
 		if (((last - first + 1) >> 8) < 64)	/* keep the screen to the big ones */
 			continue;
 		con_hex2(name, "lba=", (uint32_t)first, "MiB=", (uint32_t)((last - first + 1) >> 8));
@@ -263,4 +269,59 @@ void test_ufs(void)
 	if (esz != 128 || nent > 128)
 		return;
 	list_partitions(elba, nent);
+}
+
+/*
+ * XNU (patch 0047) keeps its console in a 4 MiB ring at the end of userdata:
+ * one header block ("SWEETLOG" | u32 version | u32 ring size | u64 total
+ * bytes written | u64 flush sequence), then the ring; byte n is at ring
+ * offset n % size. Read-only, like the rest of this file.
+ */
+#define LOG_SIZE	(4u << 20)
+#define LOG_BLOCKS	(1 + LOG_SIZE / BLOCK)
+#define LOG_TAIL	(16u * 1024)
+
+void ufs_show_log(void)
+{
+	static char tail[LOG_TAIL];
+
+	if (ud_blocks < 2 * LOG_BLOCKS) {
+		con_str("LOG", "no userdata partition");
+		return;
+	}
+	uint32_t base = ud_first + ud_blocks - LOG_BLOCKS;
+	if (read_blocks(base, 1, data)) {
+		con_str("LOG", "header read error");
+		return;
+	}
+	static const char magic[] = "SWEETLOG";
+	for (int i = 0; i < 8; i++)
+		if (data[i] != (uint8_t)magic[i]) {
+			con_str("LOG", "no SWEETLOG header");
+			return;
+		}
+	uint32_t size = data[12] | data[13] << 8 | data[14] << 16 | (uint32_t)data[15] << 24;
+	uint64_t total = le64(data + 16), seq = le64(data + 24);
+	if (size != LOG_SIZE) {
+		con_hex2("LOG", "bad size=", size, 0, 0);
+		return;
+	}
+	uint64_t n = total < LOG_TAIL ? total : LOG_TAIL;
+	for (uint64_t pos = total - n; pos < total;) {
+		uint32_t off = (uint32_t)(pos % LOG_SIZE);
+		if (read_blocks(base + 1 + off / BLOCK, 1, data)) {
+			con_str("LOG", "ring read error");
+			return;
+		}
+		uint32_t k = BLOCK - off % BLOCK;
+		if (k > total - pos)
+			k = (uint32_t)(total - pos);
+		for (uint32_t i = 0; i < k; i++)
+			tail[pos - (total - n) + i] = (char)data[off % BLOCK + i];
+		pos += k;
+	}
+	con_clear(BLACK);
+	con_set_scale(2);
+	con_hex2("SWEETLOG", "KiB=", (uint32_t)(total >> 10), "flush=", (uint32_t)seq);
+	con_tail(tail, (unsigned)n);
 }

@@ -5,9 +5,9 @@
 #include "console.h"
 #include "font.h"
 
-#define SCALE		3
-#define CH_W		(8 * SCALE)
-#define CH_H		(16 * SCALE)
+static int con_scale = 3;
+#define CH_W		(8 * con_scale)
+#define CH_H		(16 * con_scale)
 #define MARGIN		24
 #define LABEL_COLS	8
 
@@ -37,10 +37,10 @@ static void put_char(int col, char ch, uint32_t fg)
 	for (int gy = 0; gy < 16; gy++)
 		for (int gx = 0; gx < 8; gx++) {
 			uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
-			for (int sy = 0; sy < SCALE; sy++) {
-				volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (FB_STRIDE / 4)
-						       + x0 + gx * SCALE;
-				for (int sx = 0; sx < SCALE; sx++)
+			for (int sy = 0; sy < con_scale; sy++) {
+				volatile uint32_t *p = con_fb + (y0 + gy * con_scale + sy) * (FB_STRIDE / 4)
+						       + x0 + gx * con_scale;
+				for (int sx = 0; sx < con_scale; sx++)
 					p[sx] = c;
 			}
 		}
@@ -59,6 +59,53 @@ static void fmt_hex(char *buf, uint64_t v, int digits)
 	for (int i = 0; i < digits; i++)
 		buf[i] = hex[(v >> (4 * (digits - 1 - i))) & 0xf];
 	buf[digits] = 0;
+}
+
+void con_set_scale(int scale)
+{
+	con_scale = scale;
+}
+
+/* Show the end of a text: as many trailing lines as fit, long lines wrapped. */
+void con_tail(const char *t, unsigned len)
+{
+	int cols = (FB_W - 2 * MARGIN) / CH_W, rows = (FB_H - 2 * MARGIN) / CH_H - row;
+	unsigned first = len, end = len;
+	int used = 0;
+
+	if (end && t[end - 1] == '\n')
+		end--;
+	len = end;
+	while (end > 0) {
+		unsigned ls = end;
+		while (ls > 0 && t[ls - 1] != '\n')
+			ls--;
+		int n = (int)(end - ls), r = n ? (n + cols - 1) / cols : 1;
+		if (used + r > rows)
+			break;
+		used += r;
+		first = ls;
+		if (!ls)
+			break;
+		end = ls - 1;	/* skip the newline */
+	}
+	int col = 0;
+	for (unsigned i = first; i < len; i++) {
+		char ch = t[i];
+		if (ch == '\r')
+			continue;
+		if (ch == '\n') {
+			row++;
+			col = 0;
+			continue;
+		}
+		if (col == cols) {
+			row++;
+			col = 0;
+		}
+		put_char(col++, ch, WHITE);
+	}
+	row++;
 }
 
 void con_skip(void)

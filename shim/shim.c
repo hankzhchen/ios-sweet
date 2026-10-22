@@ -383,6 +383,18 @@ void shim_main(uint64_t dtb)
 	stage = "ufs";
 	test_ufs();
 	con_skip();
+	/* Then the end of XNU's persistent log, if userdata holds one. */
+	stage = "log";
+	ufs_show_log();
+#if defined(BOARD_YUPIK)
+	/*
+	 * Stay here: a reset boots Android on this phone (the IMEM bootloader
+	 * reason is ignored), and Android may reformat the HFS+ userdata.
+	 * Power + Volume Down gets back to fastboot.
+	 */
+	for (;;)
+		__asm__ volatile("wfe");
+#endif
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
 	con_str("UFS", "probe done, reset in ~3 min");
 	delay_ms(180000);
