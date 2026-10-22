@@ -24,7 +24,7 @@ cleanup() {
 	for m in "$work"/root "$work"/os "$work"/sysos "$work"/appos; do
 		mount | grep -q " on $m " && umount "$m" 2>/dev/null || true
 	done
-	for d in "${devs[@]}"; do hdiutil detach -quiet "$d" 2>/dev/null || true; done
+	for d in ${devs[@]+"${devs[@]}"}; do hdiutil detach -quiet "$d" 2>/dev/null || true; done
 	rmdir "$work"/* "$work" 2>/dev/null || true
 }
 trap cleanup EXIT
