@@ -1,0 +1,589 @@
+Only in a: .git
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -234,7 +234,7 @@
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited request in TCS%u\n", t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -320,16 +320,32 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: %#x ACTIVE %u mV vote complete\n", address, mv);
+ 	return 0;
+ }
+ 
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/*
++	 * Board-specific helper: do not apply PMIC5-LDO policy to arbitrary
++	 * resources. Allowed rails and ranges come from each board's DT:
++	 * sweet L11C (touch), yupik PM8350C L3 (touch vdd, 2.8-3.544 V) and
++	 * L12 (touch vcc_1v8, 1.8 V).
++	 */
++	static const struct { const char *res; unsigned lo, hi; } allowed[] = {
++		{ "ldoc11", 2950, 3400 },
++		{ "ldoc3", 2800, 3544 },
++		{ "ldoc12", 1800, 1800 },
++	};
++	bool ok = false;
++	for (unsigned i = 0; res && i < sizeof(allowed) / sizeof(allowed[0]); i++) {
++		if (!strcmp(res, allowed[i].res) && mv >= allowed[i].lo && mv <= allowed[i].hi) {
++			ok = true;
++		}
++	}
++	if (!ok) {
++		printf("SWEET RPMH: %s %u mV not an allowed rail/range\n", res ? res : "(null)", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1,5 +1,5 @@
+ /*
+- * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
++ * SWEET FIFO I2C touch: GT9896 Yellowstone / Focaltech 54:52 (sweet), FT3518 (yupik).
+  * Call once after the scheduler is running; all work runs on one thread.
+  * Requires ABL-loaded GENI I2C firmware; votes L11C through sweet_rpmh.c.
+  * No firmware/config upload or direct PMIC writes. Only IC data write:
+@@ -14,19 +14,36 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+-#define TOUCH_SE_PA      0x00a84000u
++/*
++ * yupik-rmx3360 branch: Realme GT Master (SM7325). FocalTech FT3518 at 0x38
++ * on QUPv3 wrapper1 SE5 (i2c13, GPIO 52/53 function qup15), IRQ GPIO 81,
++ * reset GPIO 105, vdd PM8350C L3 3.008 V, vcc_1v8 PM8350C L12 (live FDT).
++ * GCC/TLMM offsets: SC7280 (same SoC family) in Linux gcc-sc7280.c and
++ * pinctrl-sc7280.c.
++ */
++#define TOUCH_SE_PA      0x00a94000u
+ #define TOUCH_GCC_PA     0x00100000u
+-#define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
+-#define TOUCH_GCC_VOTE   0x5200cu
+-#define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
++#define TOUCH_NORTH_PA   0x0f100000u /* TLMM GPIO registers, 0x1000 per pin */
++#define TOUCH_NORTH_SIZE 0xb0000u    /* GPIO 0-175 */
++#define TOUCH_GCC_VOTE   0x52008u    /* APCS_CLOCK_BRANCH_ENA_VOTE_1 */
++#define TOUCH_GCC_MASK   ((0x0fu << 18) | (1u << 27)) /* wrap1 core/2x/m/s ahb, s5 */
++#define TOUCH_RCG       0x18600u    /* qupv3_wrap1_s5_clk_src */
++#define TOUCH_PIN_SDA    52u
++#define TOUCH_PIN_SCL    53u
++#define TOUCH_PIN_IRQ    81u
++#define TOUCH_PIN_RST    105u
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+ #define TOUCH_MAX        10u
+@@ -71,8 +88,62 @@
+ #define SE_PACK0        0x0007f8feu
+ #define SE_PACK1        0x000ffefeu
+ 
++/*
++ * GPI DMA (yupik): this SE's FIFO interface is disabled (GENI_IF_DISABLE_RO),
++ * so I2C goes through the QUPv3 wrapper1 GPI engine as in Linux
++ * drivers/dma/qcom/gpi.c + i2c-qcom-geni.c (GSI mode). DT: gpi-dma@a00000,
++ * EE offset 0x10000, apps GPIIs 1-4 (gpii-mask 0x1e; GPII 0 belongs to
++ * another VM), I2C channels <0 5 3 64> / <1 5 3 64>: SE 5, protocol 3.
++ */
++#define GPI_PA           0x00a00000u
++#define GPI_SIZE         0x60000u
++#define GPI_EE           0x10000u
++#define GPI_GPII         1u
++#define GPI_SEID         5u
++#define GPI_PROTO_I2C    3u
++#define GPII_CH_CTX(k)   (0x20000u + 0x4000u * GPI_GPII + 0x80u * (k))
++#define GPII_EV_CTX      (0x21000u + 0x4000u * GPI_GPII)
++#define GPII_CH_DB(k)    (0x22000u + 0x4000u * GPI_GPII + 0x8u * (k))
++#define GPII_EV_DB       (0x22100u + 0x4000u * GPI_GPII)
++#define GPII_CH_CMD      (0x23008u + 0x4000u * GPI_GPII)
++#define GPII_EV_CMD      (0x23010u + 0x4000u * GPI_GPII)
++#define GPII_REG(off)    ((off) + 0x4000u * GPI_GPII)
++#define GPII_CH_SCRATCH(k, i) (0x20060u + 0x4000u * GPI_GPII + 0x80u * (k) + 4u * (i))
++#define GPII_CH_QOS(k)   (0x2005cu + 0x4000u * GPI_GPII + 0x80u * (k))
++#define CTX_CONFIG       0x00u
++#define CTX_LEN          0x04u
++#define CTX_BASE_LO      0x08u
++#define CTX_BASE_HI      0x0cu
++#define CTX_RP_LO        0x10u
++#define CTX_INT_MOD      0x20u
++#define CTX_MSI_LO       0x28u
++#define CTX_MSI_HI       0x2cu
++#define CTX_RPU_LO       0x30u
++#define CTX_RPU_HI       0x34u
++#define GPI_TRE          16u
++#define GPI_CH_TRES      64u
++#define GPI_CH_LEN       (GPI_CH_TRES * GPI_TRE)          /* 1 KiB, aligned to itself */
++#define GPI_EV_LEN       ((GPI_CH_TRES << 2) * GPI_TRE)   /* ev-factor 2: 4 KiB */
++#define GPI_DMA_SIZE     0x4000u
++#define GPI_OFF_CH(k)    ((k) * GPI_CH_LEN)               /* 0x000 TX, 0x400 RX */
++#define GPI_OFF_EV       0x1000u
++#define GPI_OFF_TXBUF    0x2000u
++#define GPI_OFF_RXBUF    0x2100u
++#define TRE_DMA          0x10u
++#define TRE_GO           0x20u
++#define TRE_CONFIG0      0x22u
++#define TRE_CHAIN        (1u << 0)
++#define TRE_IEOT         (1u << 9)
++#define TRE_LINK         (1u << 11)
++#define I2C_OP_WRITE     1u
++#define I2C_OP_READ      2u
++
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
++	vm_offset_t gpi, dma;
++	uint64_t dma_pa;
++	bool gsi, gsi_configured;
++	uint32_t ch_wp[2], ev_rp;
+ 	bool started, dead, probing;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+@@ -136,8 +207,8 @@
+ static bool
+ touch_clocks(void)
+ {
+-	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
++	/* Vote on only wrapper1 and the touch SE, preserving other clock users. */
++	uint32_t mask = TOUCH_GCC_MASK;
+ 	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
+ 	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+ 	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+@@ -160,8 +231,13 @@
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
++	const uint32_t branches[] = {0x18004, 0x18008, 0x23138, 0x23140, 0x185fc};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		/* HW_CTL (bit 1): hardware gates the branch while idle, so CLK_OFF is
++		 * expected; Linux clk_branch_check_halt skips the check likewise. */
++		if (touch_rd(st.gcc, branches[i]) & 2u) {
++			continue;
++		}
+ 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+ 			    touch_rd(st.gcc, branches[i]));
+@@ -304,10 +380,279 @@
+ 	return err;
+ }
+ 
++
++/* ---- GPI DMA (GSI mode) ---- */
++
++static uint32_t
++gpi_rd(uint32_t off)
++{
++	return touch_rd(st.gpi, off - GPI_EE); /* Linux: ee_base = regs - ee_offset */
++}
++
++static void
++gpi_wr(uint32_t off, uint32_t val)
++{
++	touch_wr(st.gpi, off - GPI_EE, val);
++}
++
++static void
++gpi_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(st.dma_pa + off), len, TRUE);
++}
++
++/* Poll a context's CHSTATE (bits 23:20); commands finish in microseconds. */
++static bool
++gpi_wait_state(uint32_t ctx, uint32_t want)
++{
++	for (unsigned i = 0; i < 100000; ++i) {
++		if (((gpi_rd(ctx + CTX_CONFIG) >> 20) & 0xfu) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET TOUCH: gpi ctx %#x state %#x, want %#x; err-log %#x glob %#x\n", ctx,
++	    (gpi_rd(ctx + CTX_CONFIG) >> 20) & 0xfu, want,
++	    gpi_rd(GPII_REG(0x23200u)), gpi_rd(GPII_REG(0x23100u)));
++	return false;
++}
++
++static bool
++gpi_ch_cmd(uint32_t op, uint32_t chid, uint32_t want)
++{
++	gpi_wr(GPII_CH_CMD, (op << 24) | chid);
++	return gpi_wait_state(GPII_CH_CTX(chid), want);
++}
++
++static void
++gpi_ring_db(uint32_t chid)
++{
++	gpi_wr(GPII_CH_DB(chid), (uint32_t)(st.dma_pa + GPI_OFF_CH(chid) + st.ch_wp[chid]));
++}
++
++static void
++gpi_put_tre(uint32_t chid, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3)
++{
++	uint32_t off = GPI_OFF_CH(chid) + st.ch_wp[chid];
++	volatile uint32_t *tre = (volatile uint32_t *)(st.dma + off);
++	tre[0] = d0;
++	tre[1] = d1;
++	tre[2] = d2;
++	tre[3] = d3;
++	gpi_sync(off, GPI_TRE);
++	st.ch_wp[chid] = (st.ch_wp[chid] + GPI_TRE) % GPI_CH_LEN;
++}
++
++/*
++ * Consume events until a transfer completion on chid. Returns 0 on EOT/EOB/
++ * success, EIO on an error completion or notification, ETIMEDOUT otherwise.
++ */
+ static int
++gpi_wait_xfer(uint32_t chid)
++{
++	int result = ETIMEDOUT;
++	for (unsigned i = 0; i < 100000 && result == ETIMEDOUT; ++i) {
++		uint32_t hw = gpi_rd(GPII_EV_CTX + CTX_RP_LO) - (uint32_t)(st.dma_pa + GPI_OFF_EV);
++		if (hw >= GPI_EV_LEN || hw == st.ev_rp) {
++			delay(1);
++			continue;
++		}
++		while (st.ev_rp != hw) {
++			uint32_t off = GPI_OFF_EV + st.ev_rp;
++			gpi_sync(off, GPI_TRE);
++			volatile uint32_t *ev = (volatile uint32_t *)(st.dma + off);
++			uint32_t d2 = ev[2], d3 = ev[3];
++			uint32_t type = (d3 >> 16) & 0xffu, ev_ch = d3 >> 24, code = d2 >> 24;
++			if (type == 0x22u && ev_ch == chid && result == ETIMEDOUT) {
++				result = (code == 1u || code == 2u || code == 4u) ? 0 : EIO;
++			} else if (type == 0x31u || (type == 0x22u && code == 16u)) {
++				result = EIO; /* QUP notification (e.g. NACK) or unexpected error */
++			}
++			if (result == EIO || st.probing) {
++				printf("SWEET TOUCH: gpi ev %08x %08x %08x %08x\n", ev[0], ev[1], d2, d3);
++			}
++			/* Recycle: hand the slot back to the engine. */
++			st.ev_rp = (st.ev_rp + GPI_TRE) % GPI_EV_LEN;
++			gpi_wr(GPII_EV_DB, (uint32_t)(st.dma_pa + GPI_OFF_EV +
++			    (st.ev_rp + GPI_EV_LEN - GPI_TRE) % GPI_EV_LEN));
++		}
++	}
++	return result;
++}
++
++/* Linux geni_se_select_gpi_mode */
++static void
++gpi_se_select(void)
++{
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(st.se, 0x648, 0xffffffffu);
++	touch_wr(st.se, 0xc44, 0xffffffffu);
++	touch_wr(st.se, 0xd44, 0xffffffffu);
++	touch_wr(st.se, 0xe1c, 0);
++	touch_wr(st.se, SE_IRQ_EN, touch_rd(st.se, SE_IRQ_EN) &
++	    ~(SE_DONE | SE_TX_WM_IRQ | SE_RX_WM_IRQ | SE_RX_LAST));
++	touch_wr(st.se, SE_DMA, 1);
++	touch_wr(st.se, 0xe18, touch_rd(st.se, 0xe18) | 0x0fu);
++}
++
++/* Bring-up checkpoint: printed, then a pause so the persistent log (ufslogsecs) has it. */
++static void
++gpi_step(unsigned n, const char *what)
++{
++	printf("SWEET TOUCH: gpi step %u: %s\n", n, what);
++	touch_wait(1500);
++}
++
++static bool
++gpi_init(void)
++{
++	gpi_step(1, "map GPI block, allocate rings");
++	st.gpi = ml_io_map(GPI_PA, GPI_SIZE);
++	if (!st.gpi || kmem_alloc_contig(kernel_map, &st.dma, GPI_DMA_SIZE, GPI_DMA_SIZE - 1, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET TOUCH: gpi map/alloc failed\n");
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)st.dma);
++	if (!pn) {
++		return false;
++	}
++	st.dma_pa = ptoa_64(pn);
++	gpi_step(2, "read gpii channel/event contexts");
++	uint32_t ch0 = gpi_rd(GPII_CH_CTX(0)), ch1 = gpi_rd(GPII_CH_CTX(1)), ev = gpi_rd(GPII_EV_CTX);
++	printf("SWEET TOUCH: gpi gpii%u ch0=%#x ch1=%#x ev=%#x dma=%#llx\n", GPI_GPII, ch0, ch1, ev,
++	    st.dma_pa);
++	if (((ch0 | ch1 | ev) >> 20) & 0xfu) {
++		printf("SWEET TOUCH: gpii%u already in use; not touching it\n", GPI_GPII);
++		return false;
++	}
++	gpi_step(3, "SE to GSI mode");
++	gpi_se_select();
++	gpi_sync(0, GPI_DMA_SIZE);
++	gpi_step(4, "gpii interrupt config");
++
++	/* Interrupt configuration as Linux gpi_config_interrupts (not routed: polled). */
++	gpi_wr(GPII_REG(0x23088u), 0x4fu);
++	gpi_wr(GPII_REG(0x230b8u), 1u);
++	gpi_wr(GPII_REG(0x23098u), 3u);
++	gpi_wr(GPII_REG(0x2309cu), 1u);
++	gpi_wr(GPII_REG(0x23108u), 0xfu);
++	gpi_wr(GPII_REG(0x23120u), 0xfu);
++	gpi_wr(GPII_REG(0x23188u), 0);
++	gpi_wr(GPII_REG(0x2318cu), 0);
++	gpi_wr(GPII_REG(0x23400u), 0);
++	gpi_wr(GPII_REG(0x23404u), 0);
++	gpi_wr(GPII_REG(0x23180u), 1u);
++	gpi_wr(GPII_REG(0x23200u), 0);
++
++	/* Event ring: allocate, program, give every element to the engine. */
++	gpi_step(5, "event ring allocate");
++	gpi_wr(GPII_EV_CMD, 0u << 24);
++	if (!gpi_wait_state(GPII_EV_CTX, 1u)) {
++		return false;
++	}
++	uint64_t ev_pa = st.dma_pa + GPI_OFF_EV;
++	gpi_wr(GPII_EV_CTX + CTX_CONFIG, (GPI_TRE << 24) | (1u << 16) | 2u);
++	gpi_wr(GPII_EV_CTX + CTX_LEN, GPI_EV_LEN);
++	gpi_wr(GPII_EV_CTX + CTX_BASE_LO, (uint32_t)ev_pa);
++	gpi_wr(GPII_EV_CTX + CTX_BASE_HI, (uint32_t)(ev_pa >> 32));
++	gpi_wr(GPII_EV_DB + 4u, (uint32_t)(ev_pa >> 32));
++	gpi_wr(GPII_EV_CTX + CTX_INT_MOD, 0);
++	gpi_wr(GPII_EV_CTX + CTX_MSI_LO, 0);
++	gpi_wr(GPII_EV_CTX + CTX_MSI_HI, 0);
++	gpi_wr(GPII_EV_CTX + CTX_RPU_LO, 0);
++	gpi_wr(GPII_EV_CTX + CTX_RPU_HI, 0);
++	st.ev_rp = 0;
++	gpi_wr(GPII_EV_DB, (uint32_t)(ev_pa + GPI_EV_LEN - GPI_TRE));
++
++	/* TX (chid 0, direction out) and RX (chid 1, in) channels. */
++	gpi_step(6, "channel allocate");
++	for (uint32_t chid = 0; chid < 2; ++chid) {
++		if (!gpi_ch_cmd(0u, chid, 1u)) {
++			return false;
++		}
++		uint64_t pa = st.dma_pa + GPI_OFF_CH(chid);
++		gpi_wr(GPII_CH_CTX(chid) + CTX_CONFIG, (GPI_TRE << 24) | ((chid ? 0u : 1u) << 3) | 2u);
++		gpi_wr(GPII_CH_CTX(chid) + CTX_LEN, GPI_CH_LEN);
++		gpi_wr(GPII_CH_CTX(chid) + CTX_BASE_LO, (uint32_t)pa);
++		gpi_wr(GPII_CH_CTX(chid) + CTX_BASE_HI, (uint32_t)(pa >> 32));
++		gpi_wr(GPII_CH_DB(chid) + 4u, (uint32_t)(pa >> 32));
++		gpi_wr(GPII_CH_SCRATCH(chid, 0), ((chid ^ 1u) << 16) | (GPI_PROTO_I2C << 4) | GPI_SEID);
++		gpi_wr(GPII_CH_SCRATCH(chid, 1), 0);
++		gpi_wr(GPII_CH_SCRATCH(chid, 2), 0);
++		gpi_wr(GPII_CH_SCRATCH(chid, 3), 0);
++		gpi_wr(GPII_CH_QOS(chid), 1);
++		st.ch_wp[chid] = 0;
++	}
++	gpi_step(7, "channel start");
++	for (uint32_t chid = 0; chid < 2; ++chid) {
++		if (!gpi_ch_cmd(1u, chid, 2u)) {
++			return false;
++		}
++	}
++	printf("SWEET TOUCH: gpi gpii%u started: ch0=%#x ch1=%#x ev=%#x\n", GPI_GPII,
++	    gpi_rd(GPII_CH_CTX(0)), gpi_rd(GPII_CH_CTX(1)), gpi_rd(GPII_EV_CTX));
++	return true;
++}
++
++/* Register read over GPI: pointer write (stretch), then read; Linux geni_i2c_gpi_xfer. */
++static int
++gpi_i2c_read(uint8_t addr, const uint8_t *ptr, unsigned nptr, uint8_t *buf, unsigned len)
++{
++	if (st.dead || !nptr || nptr > 2 || !len || len > 256) {
++		return EIO;
++	}
++	volatile uint8_t *tx = (volatile uint8_t *)(st.dma + GPI_OFF_TXBUF);
++	for (unsigned i = 0; i < nptr; ++i) {
++		tx[i] = ptr[i];
++	}
++	gpi_sync(GPI_OFF_TXBUF, 64);
++	if (!st.gsi_configured) {
++		/* 100 kHz from the 19.2 MHz SE clock: t_low 11, t_high 10, t_cycle 26, div 7. */
++		gpi_put_tre(0, 11u | (10u << 8) | (26u << 16) | (1u << 24) | (1u << 25), 0, 7u,
++		    (TRE_CONFIG0 << 16) | TRE_CHAIN);
++		st.gsi_configured = true;
++	}
++	gpi_put_tre(0, I2C_OP_WRITE | ((uint32_t)addr << 8) | (1u << 26), 0, nptr,
++	    (TRE_GO << 16) | TRE_CHAIN);
++	gpi_put_tre(0, (uint32_t)(st.dma_pa + GPI_OFF_TXBUF), (uint32_t)((st.dma_pa + GPI_OFF_TXBUF) >> 32),
++	    nptr, (TRE_DMA << 16) | TRE_IEOT);
++	gpi_ring_db(0);
++	int err = gpi_wait_xfer(0);
++	if (err) {
++		goto fail;
++	}
++	gpi_sync(GPI_OFF_RXBUF, 256);
++	gpi_put_tre(1, (uint32_t)(st.dma_pa + GPI_OFF_RXBUF), (uint32_t)((st.dma_pa + GPI_OFF_RXBUF) >> 32),
++	    len, (TRE_DMA << 16) | TRE_IEOT);
++	gpi_put_tre(0, I2C_OP_READ | ((uint32_t)addr << 8), 0, len, (TRE_GO << 16) | TRE_LINK);
++	gpi_ring_db(1);
++	gpi_ring_db(0);
++	err = gpi_wait_xfer(1);
++	if (err) {
++		goto fail;
++	}
++	gpi_sync(GPI_OFF_RXBUF, 256);
++	volatile uint8_t *rx = (volatile uint8_t *)(st.dma + GPI_OFF_RXBUF);
++	for (unsigned i = 0; i < len; ++i) {
++		buf[i] = rx[i];
++	}
++	return 0;
++fail:
++	/* Channels may now be in an error state; no recovery yet: stop cleanly. */
++	st.dead = true;
++	printf("SWEET TOUCH: gpi xfer addr=%#x err=%d ch0=%#x ch1=%#x ev=%#x; stopping\n", addr, err,
++	    gpi_rd(GPII_CH_CTX(0)), gpi_rd(GPII_CH_CTX(1)), gpi_rd(GPII_EV_CTX));
++	return err;
++}
++
++static int
+ touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
+ {
+ 	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
++	if (st.gsi) {
++		return gpi_i2c_read(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u, buf, len);
++	}
+ 	int err = touch_msg(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
+ 	    NULL, 0, true);
+ 	if (err) {
+@@ -327,7 +672,7 @@
+ /* Raw read only: 0x8240 is the vendor's generic/older VERSION candidate,
+  * not a second accepted GT9896 identity. Never try a four-byte Berlin pointer:
+  * on this 16-bit IC the extra bytes would be register data writes. */
+-static int
++static int __unused
+ touch_probe_info(uint16_t reg, uint8_t *buf)
+ {
+ 	memset(buf, 0xa5, 32);
+@@ -473,6 +818,11 @@
+ 		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+ 		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+ 		if (px > 1079 || py > 2399) {
++			static unsigned bad;
++			if ((bad++ % 50u) == 0) {
++				printf("SWEET TOUCH: fts out of range x=%u y=%u raw %02x %02x %02x %02x\n",
++				    px, py, p[0], p[1], p[2], p[3]);
++			}
+ 			return EIO;
+ 		}
+ 		mask |= 1u << id;
+@@ -483,6 +833,13 @@
+ 	if (active != n) {
+ 		return EIO;
+ 	}
++	static unsigned logged;
++	if (n && logged < 20) {
++		logged++;
++		printf("SWEET TOUCH: fts n=%u id0 x=%d y=%d raw %02x %02x %02x %02x %02x %02x\n",
++		    n, x[__builtin_ctz(mask)], y[__builtin_ctz(mask)],
++		    buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]);
++	}
+ 	touch_report(mask, x, y);
+ 	return 0;
+ }
+@@ -495,6 +852,12 @@
+ 	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+ 	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+ 	    touch_rd(st.se, 0x908));
++	if (((fw >> 8) & 0xffu) == 3u && (touch_rd(st.se, 0x64) & 1u)) {
++		/* FIFO interface disabled: GSI mode only (Linux i2c-qcom-geni gpi_mode). */
++		printf("SWEET TOUCH: FIFO interface disabled; using GPI DMA\n");
++		st.gsi = gpi_init();
++		return st.gsi;
++	}
+ 	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+@@ -558,9 +921,9 @@
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+-	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
++	printf("SWEET TOUCH: mapping GCC/TLMM/SE\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
++	st.gpio = ml_io_map(TOUCH_NORTH_PA, TOUCH_NORTH_SIZE);
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+ 	if (!st.gcc || !st.gpio || !st.se) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+@@ -569,32 +932,31 @@
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
+-	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
++	printf("SWEET TOUCH: TLMM rst=%#x/%#x irq=%#x/%#x i2c=%#x/%#x; voting L12C, L3C\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(TOUCH_PIN_RST)), touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_RST)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(TOUCH_PIN_IRQ)), touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(TOUCH_PIN_SDA)), touch_rd(st.gpio, TOUCH_GPIO_CFG(TOUCH_PIN_SCL)));
+ 	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+-	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	int power_error = sweet_rpmh_vreg_enable("ldoc11", 3200);
++	touch_gpio(TOUCH_PIN_IRQ, 0, 0, 3, false, false); /* DT: bias-disable, 8 mA */
++	touch_gpio(TOUCH_PIN_RST, 0, 0, 3, true, false);  /* DT: output-low, 8 mA */
++	int power_error = sweet_rpmh_vreg_enable("ldoc12", 1800);
++	if (!power_error) {
++		power_error = sweet_rpmh_vreg_enable("ldoc3", 3008);
++	}
+ 	if (power_error) {
+-		printf("SWEET TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
++		printf("SWEET TOUCH: RPMh enable failed %d; probes skipped\n", power_error);
+ 		goto out;
+ 	}
+-	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
+ 	touch_wait(10); /* conservative rail settling; not a DT timing value */
+-	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
+-	touch_gpio(7, 1, 0, 0, false, false);
+-	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	touch_wait(2);
+-	touch_gpio(8, 0, 3, 3, true, true);
+-	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
+-	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
++	touch_gpio(TOUCH_PIN_SDA, 1, 3, 0, false, false); /* qup15, DT: pull-up, 2 mA */
++	touch_gpio(TOUCH_PIN_SCL, 1, 3, 0, false, false);
++	/* FocalTech reset: low 5 ms, then high and 200 ms for the firmware to start. */
++	touch_wait(5);
++	touch_gpio(TOUCH_PIN_RST, 0, 0, 3, true, true);
++	touch_wait(300);
++	uint8_t gid[32] = {0}, fid1 = 0, fid2 = 0;
+ 	st.probing = true;
+-	int ge = touch_probe_info(GOODIX_PID_REG, gid);
+-	printf("SWEET TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
+-	    ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11], st.irq_status);
+-	(void)touch_probe_info(0x8240, legacy);
++	int ge = ENODEV; /* no Goodix on this board: never address 0x5d */
+ 	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
+ 	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
+ 	printf("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+@@ -613,7 +975,7 @@
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+-		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) ||
++		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u) ||
+ 		    (++ticks % 10u) == 0) {
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
+ 			if (err) {
