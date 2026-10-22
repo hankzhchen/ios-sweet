@@ -1,0 +1,32 @@
+--- a/iokit/DriverKit/IORPC.h
++++ b/iokit/DriverKit/IORPC.h
+@@ -224,6 +224,13 @@
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#if KERNEL
++	/*
++	 * SWEET: Xcode 16+ iig initializes this field (newer xnu); this xnu
++	 * never reads it. Last, so the existing layout is unchanged.
++	 */
++	IORPCMessage     * kernelContent;
++#endif
+ };
+ typedef struct IORPC IORPC;
+ 
+--- a/iokit/IOKit/IORPC.h
++++ b/iokit/IOKit/IORPC.h
+@@ -224,6 +224,13 @@
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#if KERNEL
++	/*
++	 * SWEET: Xcode 16+ iig initializes this field (newer xnu); this xnu
++	 * never reads it. Last, so the existing layout is unchanged.
++	 */
++	IORPCMessage     * kernelContent;
++#endif
+ };
+ typedef struct IORPC IORPC;
+ 
