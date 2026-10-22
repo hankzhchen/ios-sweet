@@ -385,7 +385,11 @@ void shim_main(uint64_t dtb)
 	con_skip();
 	/* Then the end of XNU's persistent log, if userdata holds one. */
 	stage = "log";
+#if defined(LOG_GREP_TOUCH)
+	ufs_show_log_matching("TOUCH|RPMH|panic");
+#else
 	ufs_show_log();
+#endif
 #if defined(BOARD_YUPIK)
 	/*
 	 * Stay here: a reset boots Android on this phone (the IMEM bootloader

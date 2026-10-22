@@ -15,7 +15,7 @@ OBJCOPY=${CROSS}objcopy
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
 case "$BOARD" in
 sweet) ;;
-yupik) CFLAGS="$CFLAGS -DBOARD_YUPIK" ;;
+yupik) CFLAGS="$CFLAGS -DBOARD_YUPIK${SHIM_DEFS:+ $SHIM_DEFS}" ;;
 *) echo "error: unknown BOARD=$BOARD" >&2; exit 1 ;;
 esac
 mkdir -p out

@@ -325,3 +325,84 @@ void ufs_show_log(void)
 	con_hex2("SWEETLOG", "KiB=", (uint32_t)(total >> 10), "flush=", (uint32_t)seq);
 	con_tail(tail, (unsigned)n);
 }
+
+/* Does line contain any of the '|'-separated keys? */
+static int line_has(const char *line, unsigned len, const char *keys)
+{
+	for (const char *key = keys; *key;) {
+		unsigned klen = 0;
+		while (key[klen] && key[klen] != '|')
+			klen++;
+		for (unsigned i = 0; klen && i + klen <= len; i++) {
+			unsigned k = 0;
+			while (k < klen && line[i + k] == key[k])
+				k++;
+			if (k == klen)
+				return 1;
+		}
+		key += klen;
+		if (*key == '|')
+			key++;
+	}
+	return 0;
+}
+
+void ufs_show_log_matching(const char *keys)
+{
+	static char out[LOG_TAIL], line[256];
+	unsigned nout = 0, nline = 0;
+
+	if (ud_blocks < 2 * LOG_BLOCKS) {
+		con_str("LOG", "no userdata partition");
+		return;
+	}
+	uint32_t base = ud_first + ud_blocks - LOG_BLOCKS;
+	if (read_blocks(base, 1, data)) {
+		con_str("LOG", "header read error");
+		return;
+	}
+	static const char magic[] = "SWEETLOG";
+	for (int i = 0; i < 8; i++)
+		if (data[i] != (uint8_t)magic[i]) {
+			con_str("LOG", "no SWEETLOG header");
+			return;
+		}
+	uint64_t total = le64(data + 16);
+	uint64_t start = total > LOG_SIZE ? total - LOG_SIZE : 0;
+	for (uint64_t pos = start; pos < total;) {
+		uint32_t off = (uint32_t)(pos % LOG_SIZE);
+		if (read_blocks(base + 1 + off / BLOCK, 1, data)) {
+			con_str("LOG", "ring read error");
+			return;
+		}
+		uint32_t k = BLOCK - off % BLOCK;
+		if (k > total - pos)
+			k = (uint32_t)(total - pos);
+		for (uint32_t i = 0; i < k; i++) {
+			char c = (char)data[off % BLOCK + i];
+			if (c != '\n' && nline < sizeof(line)) {
+				line[nline++] = c;
+				continue;
+			}
+			if (c != '\n')
+				continue;	/* overlong line: keep its start */
+			if (line_has(line, nline, keys)) {
+				if (nout + nline + 1 > sizeof(out)) {	/* drop the older half */
+					unsigned keep = nout / 2;
+					for (unsigned j = 0; j < keep; j++)
+						out[j] = out[nout - keep + j];
+					nout = keep;
+				}
+				for (unsigned j = 0; j < nline; j++)
+					out[nout++] = line[j];
+				out[nout++] = '\n';
+			}
+			nline = 0;
+		}
+		pos += k;
+	}
+	con_clear(BLACK);
+	con_set_scale(2);
+	con_hex2("LOG GREP", "KiB=", (uint32_t)(total >> 10), "lines KiB=", nout >> 10);
+	con_tail(out, nout);
+}
