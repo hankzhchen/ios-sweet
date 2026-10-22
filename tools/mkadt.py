@@ -2,7 +2,10 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the board's live FDT (sweet by default). Usage:
+  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|yupik]
+--board yupik: Realme GT Master (RMX3360, SM7325), values from its live FDT;
+it always uses that phone's upper DDR bank (--highmem is implied).
 """
 import hashlib, os, struct, sys
 
@@ -39,6 +42,33 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
+# Per-board differences from sweet (the module constants above). The kernel
+# matches 'xiaomi,sweet' and 'qcom,kryo470' by IONameMatch and the /sweet-*
+# node names, so other boards keep those as extra match tokens until the
+# kernel learns their own names.
+BOARDS = {
+    'sweet': dict(
+        high_mem=(HIGH_PHYS_BASE, HIGH_MEM_SIZE), fb=(FB, FB_SIZE), vtimer=VTIMER_INTID,
+        ecid=SWEET_ECID, firmware='sweet-shim',
+        compatible=['xiaomi,sweet', 'qcom,sm7150'], cpu_compatible=['qcom,kryo470'],
+        # cores 0-5 Cortex-A55, 6-7 Cortex-A76
+        cpu_hz=[1804800000] * 6 + [2304000000] * 2),
+    'yupik': dict(
+        # live FDT memory: <0x80000000 0x39700000>, <0xc0000000 0xc0000000>,
+        # <0x1_80000000 0x1_00000000>; no reserved-memory region at or above
+        # 0x1_80000000 (8 GB model; a 12 GB one has more above).
+        high_mem=(0x180000000, 0x100000000),
+        fb=(0xe1000000, 0x2300000),  # cont_splash_region, a8r8g8b8 (shim test 2026-10-22)
+        vtimer=27,                   # timer PPIs 13/14/11/12: virtual = PPI 11
+        ecid=0x595550494b000001,     # 'YUPIK' + 1, synthetic
+        firmware='yupik-shim',
+        compatible=['realme,yupik', 'qcom,sm7325', 'xiaomi,sweet'],
+        cpu_compatible=['qcom,kryo670', 'qcom,kryo470'],
+        # MPIDR Aff1 = core: 0-3 Cortex-A55, 4-6 Cortex-A78 gold, 7 A78 prime.
+        # Nominal SM7325 maximums (not in the FDT); descriptive only.
+        cpu_hz=[1900800000] * 4 + [2208000000] * 3 + [2400000000]),
+}
+
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
@@ -74,9 +104,12 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, board='sweet'):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    b = BOARDS[board]
+    if board != 'sweet':
+        highmem = True  # only the upper bank is known to be free of carve-outs
+    phys_base, mem_size = b['high_mem'] if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
@@ -92,8 +125,8 @@ def build(seed=None, qemu=False, highmem=False):
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
         ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
-        ('firmware-version', cstr('sweet-shim')),
-        ('system-firmware-version', cstr('sweet-shim')),
+        ('firmware-version', cstr(b['firmware'])),
+        ('system-firmware-version', cstr(b['firmware'])),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
         # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
         # tolerating a missing directory). Fixed stand-in value.
@@ -111,7 +144,7 @@ def build(seed=None, qemu=False, highmem=False):
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
         # of the A11 that the iPhone X userland expects.
-        ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
+        ('unique-chip-id', struct.pack('<Q', b['ecid'])),
         ('chip-id', u32(0x8015)),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
@@ -129,8 +162,8 @@ def build(seed=None, qemu=False, highmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
-    # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
+    # SWEET SMP: all eight cores in physical-core order (sweet: 0-5 Cortex-A55,
+    # 6-7 Cortex-A76; yupik: 0-3 A55, 4-7 A78), one homogeneous cluster. The kernel defaults to one
     # and uses cpus=N to select an initial prefix (N <= 8).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
@@ -138,7 +171,7 @@ def build(seed=None, qemu=False, highmem=False):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
+            ('compatible', b''.join(cstr(c) for c in b['cpu_compatible']) + cstr('ARM,v8')),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
@@ -149,7 +182,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(b['cpu_hz'][core])),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -162,7 +195,7 @@ def build(seed=None, qemu=False, highmem=False):
         ph(),
         ('compatible', cstr('arm,gic-v3')),
         ('interrupt-controller', b''),
-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
+        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else b['vtimer'])),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
     arm_io = node('arm-io', [
@@ -191,7 +224,7 @@ def build(seed=None, qemu=False, highmem=False):
 
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
+        ('reg', u64(*b['fb'])),
         ('width', u32(FB_W)),
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),
@@ -229,9 +262,10 @@ def build(seed=None, qemu=False, highmem=False):
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    compatible = [cstr(c) for c in ['D22AP', 'iPhone10,3'] + b['compatible'] + ['AppleARM']]
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', b''.join(compatible)),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
@@ -242,9 +276,19 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    import argparse
+    ap = argparse.ArgumentParser(description='Build the Apple Device Tree for the shim payload.')
+    ap.add_argument('out')
+    ap.add_argument('--dump', action='store_true')
+    ap.add_argument('--qemu', action='store_true')
+    ap.add_argument('--highmem', action='store_true')
+    ap.add_argument('--board', choices=sorted(BOARDS), default='sweet')
+    a = ap.parse_args()
+    if a.qemu and a.board != 'sweet':
+        ap.error('--qemu builds the QEMU virt tree; it only exists for --board sweet')
+    root = build(qemu=a.qemu, highmem=a.highmem, board=a.board)
     blob = adt.serialize(root)
-    open(sys.argv[1], 'wb').write(blob)
-    if '--dump' in sys.argv:
+    open(a.out, 'wb').write(blob)
+    if a.dump:
         adt.dump(adt.parse(blob)[0])
-    print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)
+    print(f'{a.out}: {len(blob)} bytes', file=sys.stderr)

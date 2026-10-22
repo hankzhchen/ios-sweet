@@ -9,7 +9,7 @@
 #define FB_PHYS			0xe1000000UL	/* reserved-memory cont_splash_region */
 #define FB_SIZE			0x2300000UL
 #define DRAM_TOP		0x280000000UL	/* 8 GB model: last bank 0x1_80000000 + 4 GiB */
-#define VTIMER_INTID		27		/* DT timer PPIs 13/14/11/10: virtual = PPI 11 */
+#define VTIMER_INTID		27		/* DT timer PPIs 13/14/11/12: virtual = PPI 11 */
 #define PTIMER_INTID		30		/* non-secure physical = PPI 14 */
 /* No PS_HOLD node in the live FDT; PSCI SYSTEM_RESET was tested and works. */
 #else
